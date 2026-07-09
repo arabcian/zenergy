@@ -226,26 +226,24 @@ static int amd_create_sensor(struct device *dev,
 	char (*label_l)[10];
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
-	/* Identify the number of siblings per core */
+	/* Siblings per core — used only for socket count, not for cpus */
 	num_siblings = ((cpuid_ebx(0x8000001e) >> 8) & 0xff) + 1;
 
 	/*
-	 * Energy counter register is accessed at core level.
-	 * Hence, filterout the siblings.
+	 * Socket count is still derived from physical core count.
+	 * cpus itself is set to num_present_cpus() so that all logical
+	 * CPUs (including SMT siblings) get their own energy channel.
+	 * Both threads of a physical core read the same MSR and will
+	 * therefore report identical values — this is expected.
 	 */
-	cpus = num_present_cpus() / num_siblings;
-
-	/*
-	 * topology_num_cores_per_package (or c->x86_max_cores prior to 6.9) is
-	 * the linux count of physical cores.
-	 * total physical cores/ core per socket gives total number of sockets.
-	 */
-
-	sockets = cpus / c->x86_max_cores;
+	sockets = (num_present_cpus() / num_siblings) / c->x86_max_cores;
 #else
-	cpus = num_present_cpus() / __max_threads_per_core;
-	sockets = cpus / topology_num_cores_per_package();
+	sockets = (num_present_cpus() / __max_threads_per_core) /
+		   topology_num_cores_per_package();
 #endif
+
+	/* Expose one channel per logical CPU (all SMT threads included) */
+	cpus = num_present_cpus();
 
 	s_config = devm_kcalloc(dev, cpus + sockets + 1,
 				sizeof(u32), GFP_KERNEL);
