@@ -108,7 +108,15 @@ static void __accumulate_delta(struct sensor_accumulator *accum,
 			accum->prev_value + input;
 
 	accum->prev_value = input;
-	accum->cache_timeout = (jiffies + HZ + get_random_long()) % HZ;
+	/*
+	 * Cache the MSR read for a jittered window in [1s, 2s) so
+	 * frequent sysfs polling doesn't trigger an IPI + rdmsr on
+	 * every read. Previously "% HZ" was applied to the whole sum,
+	 * collapsing the timeout to an absolute jiffies value in
+	 * [0, HZ) that was already in the past on any busy system —
+	 * effectively disabling the cache entirely.
+	 */
+	accum->cache_timeout = jiffies + HZ + get_random_u32_below(HZ);
 }
 
 static void accumulate_delta(struct zenergy_data *data,
@@ -162,6 +170,31 @@ static int zenergy_read(struct device *dev,
 			return -ENODEV;
 
 		reg = ENERGY_CORE_MSR;
+	}
+
+	/*
+	 * On CPUs with 64-bit RAPL energy MSRs the register never wraps
+	 * in practice, so the software accumulator (and its 32-bit
+	 * wraparound handling in __accumulate_delta()) is unnecessary
+	 * and, worse, actively wrong: masking a 64-bit value with
+	 * zenergy_MASK (0xFFFFFFFF) throws away the upper bits, so a
+	 * channel that's read less often than it wraps silently loses
+	 * energy. Read the MSR directly for these parts.
+	 */
+	if (data->do_not_accum) {
+		u64 raw;
+		int ret;
+
+#if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
+		ret = rdmsrq_safe_on_cpu(cpu, reg, &raw);
+#else
+		ret = rdmsrl_safe_on_cpu(cpu, reg, &raw);
+#endif
+		if (ret)
+			return ret;
+
+		*val = div64_ul(raw * 1000000UL, BIT(data->energy_units));
+		return 0;
 	}
 
 	accum = &data->accums[channel];
@@ -328,6 +361,17 @@ static int zenergy_probe(struct platform_device *pdev)
 	mutex_init(&data->lock);
 	get_energy_units(data);
 
+	/*
+	 * For AMD platforms with 64-bit RAPL MSR registers, accumulation
+	 * of the energy counters is not necessary. Decide this *before*
+	 * the hwmon device is registered, since registration makes the
+	 * sysfs read callback reachable immediately and zenergy_read()
+	 * branches on do_not_accum.
+	 */
+	data->do_not_accum = !x86_match_cpu(bit32_rapl_cpus);
+	if (data->do_not_accum)
+		pr_info("CPU supports 64-bit RAPL MSR registers\n");
+
 	hwmon_dev = devm_hwmon_device_register_with_info(dev, DRVNAME,
 							 data,
 							 &data->chip,
@@ -335,22 +379,15 @@ static int zenergy_probe(struct platform_device *pdev)
 	if (IS_ERR(hwmon_dev))
 		return PTR_ERR(hwmon_dev);
 
+	if (data->do_not_accum)
+		return 0;
+
 	/*
 	 * On a system with peak wattage of 250W
 	 * timeout = 2 ^ 32 / 2 ^ energy_units / 250 secs
 	 */
 	data->timeout_ms = 1000 *
 			   BIT(min(28, 31 - data->energy_units)) / 250;
-
-	/*
-	 * For AMD platforms with 64-bit RAPL MSR registers, accumulation
-	 * of the energy counters are not necessary.
-	 */
-	if (!x86_match_cpu(bit32_rapl_cpus)) {
-		data->do_not_accum = true;
-		pr_info("CPU supports 64-bit RAPL MSR registers\n");
-		return 0;
-	}
 
 	data->wrap_accumulate = kthread_run(energy_accumulator, data,
 					    "%s", dev_name(hwmon_dev));
