@@ -76,35 +76,58 @@ static int zenergy_read_labels(struct device *dev,
 	return 0;
 }
 
-static void get_energy_units(struct zenergy_data *data)
+static int get_energy_units(struct zenergy_data *data)
 {
-	u64 rapl_units;
+	u64 rapl_units = 0;
+	int ret;
 
 #if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
-	rdmsrq_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
+	ret = rdmsrq_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
 #else
-	rdmsrl_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
+	ret = rdmsrl_safe(ENERGY_PWR_UNIT_MSR, &rapl_units);
 #endif
+	if (ret)
+		return ret;
+
 	data->energy_units = (rapl_units & zenergy_UNIT_MASK) >> 8;
+	return 0;
+}
+
+/*
+ * Convert raw energy counts (units of 1/2^units J) to microjoules.
+ * Split into integer and fractional parts so raw * 1e6 cannot overflow
+ * 64 bits on long uptimes / 64-bit counters.
+ */
+static u64 counts_to_uj(u64 raw, int units)
+{
+	u64 whole = raw >> units;
+	u64 frac = raw & (BIT_ULL(units) - 1);
+
+	return whole * 1000000ULL + ((frac * 1000000ULL) >> units);
 }
 
 static void __accumulate_delta(struct sensor_accumulator *accum,
 			       int cpu, u32 reg)
 {
 	u64 input;
+	int ret;
 
 #if KERNEL_VERSION(6, 16, 0) <= LINUX_VERSION_CODE
-	rdmsrq_safe_on_cpu(cpu, reg, &input);
+	ret = rdmsrq_safe_on_cpu(cpu, reg, &input);
 #else
-	rdmsrl_safe_on_cpu(cpu, reg, &input);
+	ret = rdmsrl_safe_on_cpu(cpu, reg, &input);
 #endif
+	/* Keep the previous state on failure instead of adding garbage */
+	if (ret)
+		return;
 	input &= zenergy_MASK;
 
 	if (input >= accum->prev_value)
 		accum->energy_ctr +=
 			input - accum->prev_value;
 	else
-		accum->energy_ctr += UINT_MAX -
+		/* 32-bit counter wrapped: 2^32 - prev + input */
+		accum->energy_ctr += (u64)UINT_MAX + 1 -
 			accum->prev_value + input;
 
 	accum->prev_value = input;
@@ -134,6 +157,8 @@ static void read_accumulate(struct zenergy_data *data)
 	for (sock = 0; sock < data->nr_socks; sock++) {
 		scpu = cpumask_first_and(cpu_online_mask,
 					 cpumask_of_node(sock));
+		if (scpu >= nr_cpu_ids)
+			continue;
 
 		accumulate_delta(data, data->nr_cpus + sock,
 				 scpu, ENERGY_PKG_MSR);
@@ -163,6 +188,8 @@ static int zenergy_read(struct device *dev,
 		cpu = cpumask_first_and(cpu_online_mask,
 					cpumask_of_node
 					(channel - data->nr_cpus));
+		if (cpu >= nr_cpu_ids)
+			return -ENODEV;
 		reg = ENERGY_PKG_MSR;
 	} else {
 		cpu = channel;
@@ -193,7 +220,7 @@ static int zenergy_read(struct device *dev,
 		if (ret)
 			return ret;
 
-		*val = div64_ul(raw * 1000000UL, BIT(data->energy_units));
+		*val = counts_to_uj(raw, data->energy_units);
 		return 0;
 	}
 
@@ -205,7 +232,7 @@ static int zenergy_read(struct device *dev,
 	energy = accum->energy_ctr;
 	mutex_unlock(&data->lock);
 
-	*val = div64_ul(energy * 1000000UL, BIT(data->energy_units));
+	*val = counts_to_uj(energy, data->energy_units);
 
 	return 0;
 }
@@ -359,7 +386,9 @@ static int zenergy_probe(struct platform_device *pdev)
 		return ret;
 
 	mutex_init(&data->lock);
-	get_energy_units(data);
+	ret = get_energy_units(data);
+	if (ret)
+		return ret;
 
 	/*
 	 * For AMD platforms with 64-bit RAPL MSR registers, accumulation
